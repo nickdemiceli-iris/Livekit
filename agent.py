@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
+from urllib import request
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -57,6 +60,14 @@ class CallDispositionState:
     notes: str = ""
 
 
+@dataclass
+class TranscriptTurn:
+    timestamp_utc: str
+    role: str
+    text: str
+    interrupted: bool = False
+
+
 def _as_money(value: Any) -> str:
     if isinstance(value, (int, float)):
         return f"${value:.2f}"
@@ -101,6 +112,172 @@ def build_customer_context(customer: dict[str, Any]) -> str:
         )
 
     return "\n".join(lines)
+
+
+def _to_role_string(role: Any) -> str:
+    value = getattr(role, "value", role)
+    return str(value).lower()
+
+
+def _extract_item_text(item: Any) -> str:
+    text_content = getattr(item, "text_content", None)
+    if text_content:
+        return str(text_content).strip()
+
+    content = getattr(item, "content", None)
+    if not content:
+        return ""
+
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            if part.strip():
+                parts.append(part.strip())
+            continue
+        transcript = getattr(part, "transcript", None)
+        if transcript and str(transcript).strip():
+            parts.append(str(transcript).strip())
+    return " ".join(parts).strip()
+
+
+def _classify_objection(reason_or_text: str) -> str:
+    text = reason_or_text.lower()
+    if not text.strip():
+        return "none"
+
+    if any(k in text for k in ["rate", "interest", "apr", "payment too high", "cost"]):
+        return "rate_or_payment"
+    if any(k in text for k in ["already got", "already funded", "already have a loan"]):
+        return "already_solved"
+    if any(k in text for k in ["not interested", "no thanks", "don't want", "do not want"]):
+        return "not_interested"
+    if any(k in text for k in ["busy", "call me later", "another time", "not a good time"]):
+        return "timing"
+    if any(k in text for k in ["scam", "trust", "legit", "real company"]):
+        return "trust"
+    if any(k in text for k in ["not in florida", "outside florida", "don't live in florida"]):
+        return "eligibility_location"
+    if any(k in text for k in ["more than", "higher amount", "need more", "larger amount"]):
+        return "amount_too_low"
+    return "other"
+
+
+def _derive_outcome(disposition: CallDispositionState) -> str:
+    if not disposition.customer_reached:
+        return "not_reached"
+    if disposition.customer_interested is False:
+        return "not_interested"
+    if disposition.referred_to_loan_officer:
+        return "loan_officer_referral"
+    if disposition.next_step:
+        if "inspection" in disposition.next_step:
+            return "inspection_scheduled"
+        if "callback" in disposition.next_step:
+            return "callback_scheduled"
+    if disposition.customer_interested is True:
+        return "interested_pending_next_step"
+    return "incomplete"
+
+
+def _derive_callback_needed(disposition: CallDispositionState) -> bool:
+    if not disposition.customer_reached:
+        return True
+    if disposition.next_step and "callback" in disposition.next_step:
+        return True
+    return False
+
+
+def _extract_requested_amount_from_transcript(transcript: list[TranscriptTurn]) -> float | None:
+    amount_pattern = re.compile(r"\$?\s*(\d{2,6}(?:\.\d{1,2})?)")
+    for turn in transcript:
+        if turn.role not in {"user", "human", "customer"}:
+            continue
+        if any(k in turn.text.lower() for k in ["borrow", "need", "amount"]):
+            match = amount_pattern.search(turn.text.replace(",", ""))
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    pass
+    return None
+
+
+def _build_post_call_report(
+    *,
+    customer_profile: dict[str, Any],
+    disposition: CallDispositionState,
+    transcript: list[TranscriptTurn],
+    call_started_at: datetime,
+    call_ended_at: datetime,
+    room_name: str,
+) -> dict[str, Any]:
+    transcript_text = " ".join(t.text for t in transcript).strip()
+    objection_source = disposition.not_interested_reason or transcript_text
+    requested_amount = disposition.requested_loan_amount_usd
+    if requested_amount is None:
+        requested_amount = _extract_requested_amount_from_transcript(transcript)
+
+    outcome = _derive_outcome(disposition)
+    callback_needed = _derive_callback_needed(disposition)
+
+    return {
+        "call_metadata": {
+            "customer_name": customer_profile.get("customer_name"),
+            "campaign_type": customer_profile.get("campaign_type"),
+            "script_version": customer_profile.get("script_version"),
+            "room_name": room_name,
+            "started_at_utc": call_started_at.isoformat(),
+            "ended_at_utc": call_ended_at.isoformat(),
+            "duration_seconds": max(
+                0, int((call_ended_at - call_started_at).total_seconds())
+            ),
+        },
+        "transcript": [asdict(turn) for turn in transcript],
+        "analysis": {
+            "outcome": outcome,
+            "requested_amount_usd": requested_amount,
+            "callback_needed": callback_needed,
+            "callback_datetime": disposition.next_step_datetime
+            if disposition.next_step and "callback" in disposition.next_step
+            else None,
+            "objection_category": _classify_objection(objection_source),
+            "objection_reason": disposition.not_interested_reason,
+        },
+        "disposition": asdict(disposition),
+    }
+
+
+def _persist_post_call_report(report: dict[str, Any]) -> str:
+    output_dir = os.getenv("POST_CALL_OUTPUT_DIR", "post_call_reports")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    customer_name = str(
+        report.get("call_metadata", {}).get("customer_name", "unknown")
+    ).lower()
+    safe_name = re.sub(r"[^a-z0-9]+", "_", customer_name).strip("_") or "unknown"
+    filename = f"{timestamp}_{safe_name}.json"
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    return path
+
+
+def _post_report_to_webhook(report: dict[str, Any]) -> tuple[bool, str]:
+    webhook_url = os.getenv("POST_CALL_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        return False, "POST_CALL_WEBHOOK_URL not set; skipped webhook post."
+    payload = json.dumps(report).encode("utf-8")
+    req = request.Request(
+        webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            return True, f"Webhook post succeeded with status {resp.status}."
+    except Exception as exc:
+        return False, f"Webhook post failed: {exc}"
 
 
 class SalesAgent(Agent):
@@ -208,6 +385,8 @@ def build_agent() -> tuple[SalesAgent, CallDispositionState]:
 async def entrypoint(ctx: JobContext) -> None:
     agent, disposition = build_agent()
     await ctx.connect()
+    call_started_at = datetime.now(tz=timezone.utc)
+    transcript: list[TranscriptTurn] = []
 
     session = AgentSession(
         stt=assemblyai.STT(model="universal-streaming-multilingual"),
@@ -215,6 +394,23 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=cartesia.TTS(model="sonic-3", language="en"),
         vad=silero.VAD.load(),
     )
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(event: Any) -> None:
+        item = getattr(event, "item", None)
+        if item is None:
+            return
+        text = _extract_item_text(item)
+        if not text:
+            return
+        transcript.append(
+            TranscriptTurn(
+                timestamp_utc=datetime.now(tz=timezone.utc).isoformat(),
+                role=_to_role_string(getattr(item, "role", "unknown")),
+                text=text,
+                interrupted=bool(getattr(item, "interrupted", False)),
+            )
+        )
 
     customer_name = str(CUSTOMER_PROFILE.get("customer_name", "there"))
     await session.start(room=ctx.room, agent=agent)
@@ -233,8 +429,27 @@ async def entrypoint(ctx: JobContext) -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        call_ended_at = datetime.now(tz=timezone.utc)
+        room_name = str(getattr(ctx.room, "name", "unknown"))
+        report = _build_post_call_report(
+            customer_profile=CUSTOMER_PROFILE,
+            disposition=disposition,
+            transcript=transcript,
+            call_started_at=call_started_at,
+            call_ended_at=call_ended_at,
+            room_name=room_name,
+        )
+        report_path = _persist_post_call_report(report)
+        posted, webhook_message = _post_report_to_webhook(report)
+
         print("=== CALL DISPOSITION SUMMARY ===")
         print(json.dumps(asdict(disposition), indent=2))
+        print("=== POST CALL REPORT ===")
+        print(json.dumps(report, indent=2))
+        print(f"Saved report: {report_path}")
+        print(webhook_message)
+        if posted:
+            print("Webhook delivery: success")
 
 
 if __name__ == "__main__":
