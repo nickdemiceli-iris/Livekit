@@ -74,7 +74,7 @@ def _as_money(value: Any) -> str:
     return "N/A"
 
 
-def build_customer_context(
+def build_lead_context(
     lead: dict[str, Any],
     campaign_type: str,
     script_version: str | None,
@@ -285,14 +285,14 @@ def build_agent() -> tuple[SalesAgent, SalesCallDispositionState]:
             str(script_version_value) if script_version_value is not None else None
         ),
     )
-    customer_context = build_customer_context(
+    lead_context = build_lead_context(
         LEAD_PROFILE,
         campaign_type=policy.campaign_type,
         script_version=policy.script_version,
     )
     customer_name = str(LEAD_PROFILE.get("customer_name", "there"))
     prompt = build_system_prompt(
-        customer_context=customer_context,
+        lead_context=lead_context,
         customer_name=customer_name,
         campaign_type=policy.campaign_type,
         script_version=policy.script_version,

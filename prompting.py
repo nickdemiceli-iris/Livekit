@@ -116,7 +116,7 @@ Cold lead flow (not pre-approved):
 
 def build_system_prompt(
     *,
-    customer_context: str,
+    lead_context: str,
     customer_name: str,
     campaign_type: str,
     script_version: str | None,
@@ -174,6 +174,6 @@ Closing expectation:
 - End with a precise recap of agreed next step (who calls, when, and at what number).
 - Thank the customer for their time.
 
-Customer context:
-{customer_context}
+Lead context:
+{lead_context}
 """.strip()
