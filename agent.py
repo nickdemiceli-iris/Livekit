@@ -18,7 +18,7 @@ from livekit.agents import (
 )
 from livekit.plugins import assemblyai, cartesia, openai, silero
 
-from prompting import CAMPAIGN_PRE_APPROVED, build_system_prompt, resolve_campaign_policy
+from prompting import build_system_prompt
 
 load_dotenv()
 
@@ -46,24 +46,15 @@ LEAD_PROFILE: dict[str, Any] = {
 @dataclass
 class SalesCallDispositionState:
     intended_customer_reached: bool = False
-    callback_requested_with_non_customer: bool = False
     callback_time_for_customer: str | None = None
     customer_interested: bool | None = None
     not_interested_reason: str | None = None
     requested_loan_amount_usd: float | None = None
     requested_more_than_preapproved: bool = False
+    qualification_summary: str | None = None
     referred_to_loan_officer: bool = False
-    still_driving_vehicle: bool | None = None
-    owns_vehicle_free_and_clear: bool | None = None
-    current_lender: str | None = None
-    payoff_amount_usd: float | None = None
-    florida_resident: bool | None = None
-    vin_available: bool | None = None
-    mileage_available: bool | None = None
-    inspection_scheduled: bool = False
-    inspection_datetime: str | None = None
-    human_callback_scheduled: bool = False
-    human_callback_datetime: str | None = None
+    next_step_type: str | None = None
+    next_step_datetime: str | None = None
     confirmed_best_phone_number: str | None = None
     notes: str = ""
 
@@ -75,10 +66,12 @@ def _as_money(value: Any) -> str:
 
 
 def build_lead_context(
-    lead: dict[str, Any],
-    campaign_type: str,
-    script_version: str | None,
+    lead: dict[str, Any]
 ) -> str:
+    campaign_type = str(lead.get("campaign_type", "pre_approved")).lower()
+    script_version_value = lead.get("script_version")
+    script_version = str(script_version_value).upper() if script_version_value else "N/A"
+
     lines = [
         f"- Customer Name: {lead['customer_name']}",
         (
@@ -96,7 +89,7 @@ def build_lead_context(
         f"- Language Preference: {lead.get('language_preference', 'English')}",
         f"- Today's Date: {date.today().isoformat()}",
     ]
-    if campaign_type == CAMPAIGN_PRE_APPROVED:
+    if campaign_type == "pre_approved":
         lines.extend(
             [
                 f"- Pre-Approved Amount: {_as_money(lead.get('advance_amount_usd'))}",
@@ -127,27 +120,16 @@ class SalesAgent(Agent):
         self,
         context: RunContext,
         reached: bool = True,
+        callback_time: str = "",
         note: str = "",
     ) -> str:
-        """Record whether the intended customer was reached."""
+        """Record whether intended customer was reached and callback timing."""
         self._disposition.intended_customer_reached = reached
+        if not reached and callback_time:
+            self._disposition.callback_time_for_customer = callback_time
         if note:
             self._append_note(note)
         return "Intended customer reach status recorded."
-
-    @function_tool
-    async def mark_non_customer_callback(
-        self,
-        context: RunContext,
-        callback_time: str,
-        note: str = "",
-    ) -> str:
-        """Record callback time provided by a non-customer."""
-        self._disposition.callback_requested_with_non_customer = True
-        self._disposition.callback_time_for_customer = callback_time
-        if note:
-            self._append_note(note)
-        return "Non-customer callback details recorded."
 
     @function_tool
     async def mark_interest_outcome(
@@ -177,41 +159,14 @@ class SalesAgent(Agent):
         return "Requested amount recorded."
 
     @function_tool
-    async def mark_qualification_answers(
+    async def mark_qualification_summary(
         self,
         context: RunContext,
-        still_driving_vehicle: bool,
-        owns_vehicle_free_and_clear: bool,
-        florida_resident: bool,
-        current_lender: str = "",
-        payoff_amount_usd: float | None = None,
+        qualification_summary: str,
     ) -> str:
-        """Record qualification responses and payoff details when applicable."""
-        self._disposition.still_driving_vehicle = still_driving_vehicle
-        self._disposition.owns_vehicle_free_and_clear = owns_vehicle_free_and_clear
-        self._disposition.florida_resident = florida_resident
-        if not owns_vehicle_free_and_clear:
-            self._disposition.current_lender = current_lender or None
-            self._disposition.payoff_amount_usd = payoff_amount_usd
-        else:
-            self._disposition.current_lender = None
-            self._disposition.payoff_amount_usd = None
-        return "Qualification answers recorded."
-
-    @function_tool
-    async def mark_vehicle_data_readiness(
-        self,
-        context: RunContext,
-        vin_available: bool,
-        mileage_available: bool,
-        note: str = "",
-    ) -> str:
-        """Record whether VIN and mileage are available."""
-        self._disposition.vin_available = vin_available
-        self._disposition.mileage_available = mileage_available
-        if note:
-            self._append_note(note)
-        return "VIN and mileage readiness recorded."
+        """Record a concise summary of qualification answers."""
+        self._disposition.qualification_summary = qualification_summary.strip()
+        return "Qualification summary recorded."
 
     @function_tool
     async def mark_referral_to_loan_officer(
@@ -226,36 +181,21 @@ class SalesAgent(Agent):
         return "Loan officer referral recorded."
 
     @function_tool
-    async def mark_inspection_schedule(
+    async def mark_next_step(
         self,
         context: RunContext,
-        inspection_datetime: str,
+        next_step_type: str,
+        next_step_datetime: str,
         best_phone_number: str,
         note: str = "",
     ) -> str:
-        """Record scheduled inspection time and confirmed phone number."""
-        self._disposition.inspection_scheduled = True
-        self._disposition.inspection_datetime = inspection_datetime
+        """Record next step type/time and confirmed phone number."""
+        self._disposition.next_step_type = next_step_type.strip().lower()
+        self._disposition.next_step_datetime = next_step_datetime
         self._disposition.confirmed_best_phone_number = best_phone_number
         if note:
             self._append_note(note)
-        return "Inspection schedule recorded."
-
-    @function_tool
-    async def mark_human_callback_schedule(
-        self,
-        context: RunContext,
-        callback_datetime: str,
-        best_phone_number: str,
-        note: str = "",
-    ) -> str:
-        """Record scheduled callback by a human representative."""
-        self._disposition.human_callback_scheduled = True
-        self._disposition.human_callback_datetime = callback_datetime
-        self._disposition.confirmed_best_phone_number = best_phone_number
-        if note:
-            self._append_note(note)
-        return "Human callback schedule recorded."
+        return "Next-step details recorded."
 
     @function_tool
     async def add_call_note(
@@ -278,25 +218,19 @@ class SalesAgent(Agent):
 
 
 def build_agent() -> tuple[SalesAgent, SalesCallDispositionState]:
+    campaign_type = str(LEAD_PROFILE.get("campaign_type", "pre_approved")).lower()
     script_version_value = LEAD_PROFILE.get("script_version")
-    policy = resolve_campaign_policy(
-        campaign_type=str(LEAD_PROFILE.get("campaign_type", "cold")),
-        script_version=(
-            str(script_version_value) if script_version_value is not None else None
-        ),
-    )
-    lead_context = build_lead_context(
-        LEAD_PROFILE,
-        campaign_type=policy.campaign_type,
-        script_version=policy.script_version,
-    )
+    script_version = str(script_version_value).upper() if script_version_value else None
+    if campaign_type != "pre_approved":
+        script_version = None
+
+    lead_context = build_lead_context(LEAD_PROFILE)
     customer_name = str(LEAD_PROFILE.get("customer_name", "there"))
     prompt = build_system_prompt(
         lead_context=lead_context,
         customer_name=customer_name,
-        campaign_type=policy.campaign_type,
-        script_version=policy.script_version,
-        terms_review_mode=policy.terms_review_mode,
+        campaign_type=campaign_type,
+        script_version=script_version,
     )
     disposition = SalesCallDispositionState()
     return SalesAgent(instructions=prompt, disposition=disposition), disposition
