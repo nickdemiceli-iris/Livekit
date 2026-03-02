@@ -140,11 +140,17 @@ def _extract_item_text(item: Any) -> str:
     return " ".join(parts).strip()
 
 
+def _is_user_role(role: str) -> bool:
+    return role in {"user", "human", "customer"}
+
+
 def _classify_objection(reason_or_text: str) -> str:
     text = reason_or_text.lower()
     if not text.strip():
         return "none"
 
+    if any(k in text for k in ["fuck off", "stop calling", "leave me alone"]):
+        return "hostile_rejection"
     if any(k in text for k in ["rate", "interest", "apr", "payment too high", "cost"]):
         return "rate_or_payment"
     if any(k in text for k in ["already got", "already funded", "already have a loan"]):
@@ -190,7 +196,7 @@ def _derive_callback_needed(disposition: CallDispositionState) -> bool:
 def _extract_requested_amount_from_transcript(transcript: list[TranscriptTurn]) -> float | None:
     amount_pattern = re.compile(r"\$?\s*(\d{2,6}(?:\.\d{1,2})?)")
     for turn in transcript:
-        if turn.role not in {"user", "human", "customer"}:
+        if not _is_user_role(turn.role):
             continue
         if any(k in turn.text.lower() for k in ["borrow", "need", "amount"]):
             match = amount_pattern.search(turn.text.replace(",", ""))
@@ -202,6 +208,55 @@ def _extract_requested_amount_from_transcript(transcript: list[TranscriptTurn]) 
     return None
 
 
+def _infer_disposition_from_transcript(
+    disposition: CallDispositionState,
+    transcript: list[TranscriptTurn],
+    customer_name: str,
+) -> None:
+    user_turns = [t for t in transcript if _is_user_role(t.role)]
+    if not user_turns:
+        return
+
+    user_texts = [t.text.lower() for t in user_turns if t.text.strip()]
+    customer_first = customer_name.split()[0].lower() if customer_name.strip() else ""
+
+    if not disposition.customer_reached:
+        reached_markers = ["this is", "speaking", "that's me", "yes this is", "yeah this is"]
+        if any(m in txt for txt in user_texts for m in reached_markers):
+            disposition.customer_reached = True
+        elif customer_first and any(customer_first in txt for txt in user_texts):
+            disposition.customer_reached = True
+
+    if disposition.customer_interested is None:
+        negative_markers = [
+            "not interested",
+            "don't need",
+            "do not need",
+            "no thanks",
+            "fuck off",
+            "stop calling",
+        ]
+        positive_markers = ["sure", "yes", "yeah", "yep", "interested", "okay", "ok"]
+        if any(m in txt for txt in user_texts for m in negative_markers):
+            disposition.customer_interested = False
+        elif any(re.search(rf"\b{re.escape(m)}\b", txt) for txt in user_texts for m in positive_markers):
+            disposition.customer_interested = True
+
+    if disposition.customer_interested is False and not disposition.not_interested_reason:
+        for txt in user_texts:
+            if any(
+                m in txt
+                for m in ["not interested", "don't need", "do not need", "no thanks", "fuck off", "stop calling"]
+            ):
+                disposition.not_interested_reason = txt
+                break
+
+    if disposition.requested_loan_amount_usd is None:
+        disposition.requested_loan_amount_usd = _extract_requested_amount_from_transcript(
+            transcript
+        )
+
+
 def _build_post_call_report(
     *,
     customer_profile: dict[str, Any],
@@ -211,11 +266,13 @@ def _build_post_call_report(
     call_ended_at: datetime,
     room_name: str,
 ) -> dict[str, Any]:
-    transcript_text = " ".join(t.text for t in transcript).strip()
-    objection_source = disposition.not_interested_reason or transcript_text
+    user_transcript_text = " ".join(
+        t.text for t in transcript if _is_user_role(t.role)
+    ).strip()
+    objection_source = disposition.not_interested_reason or (
+        user_transcript_text if disposition.customer_interested is False else ""
+    )
     requested_amount = disposition.requested_loan_amount_usd
-    if requested_amount is None:
-        requested_amount = _extract_requested_amount_from_transcript(transcript)
 
     outcome = _derive_outcome(disposition)
     callback_needed = _derive_callback_needed(disposition)
@@ -289,6 +346,9 @@ def _finalize_post_call(
     room_name: str,
     trigger: str,
 ) -> None:
+    customer_name = str(customer_profile.get("customer_name", "")).strip()
+    _infer_disposition_from_transcript(disposition, transcript, customer_name)
+
     call_ended_at = datetime.now(tz=timezone.utc)
     report = _build_post_call_report(
         customer_profile=customer_profile,
