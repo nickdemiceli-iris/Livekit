@@ -39,7 +39,8 @@ Pre-approved client flow:
    - If not free and clear, ask lender name first (single question).
    - Then ask payoff amount owed (single question).
    - Live in Florida? If no, explain loans are currently for Florida residents only.
-   - How much would they like to borrow?
+   - Then ask amount using this style:
+     "Since you're pre-approved for up to $[advance_amount], would you like to borrow the full amount or just a portion of it?"
 {terms_step}
 8) Confirm best phone number.
 9) Recap next step date/time and thank them.
