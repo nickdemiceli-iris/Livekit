@@ -259,7 +259,7 @@ def _persist_post_call_report(report: dict[str, Any]) -> str:
     path = os.path.join(output_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
-    return path
+    return os.path.abspath(path)
 
 
 def _post_report_to_webhook(report: dict[str, Any]) -> tuple[bool, str]:
@@ -278,6 +278,38 @@ def _post_report_to_webhook(report: dict[str, Any]) -> tuple[bool, str]:
             return True, f"Webhook post succeeded with status {resp.status}."
     except Exception as exc:
         return False, f"Webhook post failed: {exc}"
+
+
+def _finalize_post_call(
+    *,
+    customer_profile: dict[str, Any],
+    disposition: CallDispositionState,
+    transcript: list[TranscriptTurn],
+    call_started_at: datetime,
+    room_name: str,
+    trigger: str,
+) -> None:
+    call_ended_at = datetime.now(tz=timezone.utc)
+    report = _build_post_call_report(
+        customer_profile=customer_profile,
+        disposition=disposition,
+        transcript=transcript,
+        call_started_at=call_started_at,
+        call_ended_at=call_ended_at,
+        room_name=room_name,
+    )
+    report["call_metadata"]["finalization_trigger"] = trigger
+    report_path = _persist_post_call_report(report)
+    posted, webhook_message = _post_report_to_webhook(report)
+
+    print("=== CALL DISPOSITION SUMMARY ===", flush=True)
+    print(json.dumps(asdict(disposition), indent=2), flush=True)
+    print("=== POST CALL REPORT ===", flush=True)
+    print(json.dumps(report, indent=2), flush=True)
+    print(f"Saved report: {report_path}", flush=True)
+    print(webhook_message, flush=True)
+    if posted:
+        print("Webhook delivery: success", flush=True)
 
 
 class SalesAgent(Agent):
@@ -387,6 +419,7 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     call_started_at = datetime.now(tz=timezone.utc)
     transcript: list[TranscriptTurn] = []
+    finalized = False
 
     session = AgentSession(
         stt=assemblyai.STT(model="universal-streaming-multilingual"),
@@ -412,6 +445,29 @@ async def entrypoint(ctx: JobContext) -> None:
             )
         )
 
+    def _finalize_once(trigger: str) -> None:
+        nonlocal finalized
+        if finalized:
+            return
+        finalized = True
+        room_name = str(getattr(ctx.room, "name", "unknown"))
+        try:
+            _finalize_post_call(
+                customer_profile=CUSTOMER_PROFILE,
+                disposition=disposition,
+                transcript=transcript,
+                call_started_at=call_started_at,
+                room_name=room_name,
+                trigger=trigger,
+            )
+        except Exception as exc:
+            print(f"Post-call finalization error: {exc}", flush=True)
+
+    @session.on("close")
+    def _on_session_close(event: Any) -> None:
+        reason = str(getattr(event, "reason", "unknown"))
+        _finalize_once(f"session_close:{reason}")
+
     customer_name = str(CUSTOMER_PROFILE.get("customer_name", "there"))
     await session.start(room=ctx.room, agent=agent)
     await session.generate_reply(
@@ -429,27 +485,7 @@ async def entrypoint(ctx: JobContext) -> None:
     except asyncio.CancelledError:
         pass
     finally:
-        call_ended_at = datetime.now(tz=timezone.utc)
-        room_name = str(getattr(ctx.room, "name", "unknown"))
-        report = _build_post_call_report(
-            customer_profile=CUSTOMER_PROFILE,
-            disposition=disposition,
-            transcript=transcript,
-            call_started_at=call_started_at,
-            call_ended_at=call_ended_at,
-            room_name=room_name,
-        )
-        report_path = _persist_post_call_report(report)
-        posted, webhook_message = _post_report_to_webhook(report)
-
-        print("=== CALL DISPOSITION SUMMARY ===")
-        print(json.dumps(asdict(disposition), indent=2))
-        print("=== POST CALL REPORT ===")
-        print(json.dumps(report, indent=2))
-        print(f"Saved report: {report_path}")
-        print(webhook_message)
-        if posted:
-            print("Webhook delivery: success")
+        _finalize_once("entrypoint_finally")
 
 
 if __name__ == "__main__":
