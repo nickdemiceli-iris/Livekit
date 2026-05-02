@@ -119,6 +119,9 @@ Data to capture when possible:
 - Agreed next step, date/time, and best phone number.
 
 Tool usage requirement:
+- If the customer asks a question about company policy/process/fees/timelines/eligibility/documents, call lookup_knowledgebase first.
+- When answering policy/process questions, use facts returned by lookup_knowledgebase and do not invent missing details.
+- If lookup_knowledgebase says no direct match, say you do not have that policy detail and offer to escalate to a human.
 - Use tools during the call to capture key fields as soon as they are known.
 - Call mark_interest_outcome after identity confirmation and whenever interest changes.
 - Call mark_requested_loan_amount when the customer states an amount.
