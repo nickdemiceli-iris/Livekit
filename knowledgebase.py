@@ -274,6 +274,45 @@ class GCSKnowledgebase:
             + "\n\n".join(sections)
         )
 
+    async def answer_operational_question(self, question: str) -> str | None:
+        """
+        Return a deterministic operational answer for high-risk facts
+        (portal domain, payment-by-phone number, business hours), or None.
+        """
+        prompt = question.strip().lower()
+        if not prompt:
+            return None
+
+        snapshot = await self._get_snapshot()
+        if not snapshot.chunks:
+            return None
+
+        asks_portal = any(
+            k in prompt for k in ("pay online", "payment portal", "portal", "domain", "website", "site")
+        )
+        asks_hours = any(k in prompt for k in ("hours", "open", "saturday", "weekend"))
+        asks_phone_payment = any(
+            k in prompt for k in ("pay by phone", "payment by phone", "call to pay", "phone number")
+        )
+
+        answers: list[str] = []
+        if asks_portal:
+            portal = _extract_payment_portal(snapshot)
+            if portal:
+                answers.append(f"You can pay online at {portal[0]}.")
+        if asks_hours:
+            hours = _extract_phone_payment_hours(snapshot)
+            if hours:
+                answers.append(f"Our phone payment hours are {hours[0]}.")
+        if asks_phone_payment:
+            phone = _extract_phone_payment_number(snapshot)
+            if phone:
+                answers.append(f"You can make a phone payment by calling {phone[0]}.")
+
+        if not answers:
+            return None
+        return " ".join(answers)
+
     async def _get_snapshot(self) -> _Snapshot:
         now = time.monotonic()
         snapshot = self._snapshot

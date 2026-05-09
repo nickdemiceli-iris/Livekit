@@ -404,6 +404,30 @@ class SalesAgent(Agent):
         return await self._knowledgebase.query(question)
 
     @function_tool
+    async def answer_operational_question(
+        self,
+        context: RunContext,
+        question: str,
+    ) -> str:
+        """
+        Answer high-risk operational KB questions deterministically.
+
+        Use this for payment portal/domain, payment-by-phone number, and business hours.
+        """
+        if self._knowledgebase is None:
+            return (
+                "I do not have that operational detail available in my current knowledge base. "
+                "I can connect you with a human team member to confirm it."
+            )
+        resolved = await self._knowledgebase.answer_operational_question(question)
+        if resolved:
+            return resolved
+        return (
+            "I do not have that exact operational detail in the knowledge base right now. "
+            "I can connect you with a human team member to confirm it."
+        )
+
+    @function_tool
     async def mark_interest_outcome(
         self,
         context: RunContext,
