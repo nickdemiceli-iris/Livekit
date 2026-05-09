@@ -68,6 +68,65 @@ def _chunk_text(content: str, *, max_chunk_chars: int) -> list[str]:
     return [c for c in chunks if c]
 
 
+def _normalize_domain(raw: str) -> str:
+    value = raw.strip().rstrip(".,;")
+    value = re.sub(r"^https?://", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def _extract_payment_portal(snapshot: "_Snapshot") -> tuple[str, str] | None:
+    patterns = (
+        re.compile(
+            r"(?:pay online at|payment portal)\s*[:\-]?\s*(https?://\S+|[a-z0-9.-]+\.[a-z]{2,}(?:/\S*)?)",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b([a-z0-9.-]+\.[a-z]{2,}(?:/\S*)?)\b",
+            flags=re.IGNORECASE,
+        ),
+    )
+    for chunk in snapshot.chunks:
+        low = chunk.text.lower()
+        if "payment portal" not in low and "pay online" not in low:
+            continue
+        for idx, pattern in enumerate(patterns):
+            match = pattern.search(chunk.text)
+            if not match:
+                continue
+            value = _normalize_domain(match.group(1))
+            if idx == 1 and "." not in value:
+                continue
+            return value, chunk.source
+    return None
+
+
+def _extract_phone_payment_hours(snapshot: "_Snapshot") -> tuple[str, str] | None:
+    pattern = re.compile(r"hours\s*:\s*([^\n]+)", flags=re.IGNORECASE)
+    for chunk in snapshot.chunks:
+        low = chunk.text.lower()
+        if "payment by phone" not in low and "hours" not in low:
+            continue
+        match = pattern.search(chunk.text)
+        if match:
+            return match.group(1).strip(), chunk.source
+    return None
+
+
+def _extract_phone_payment_number(snapshot: "_Snapshot") -> tuple[str, str] | None:
+    pattern = re.compile(
+        r"(?:calling|call(?:ing)?)\s*:\s*([+()0-9\-\s]{10,})",
+        flags=re.IGNORECASE,
+    )
+    for chunk in snapshot.chunks:
+        low = chunk.text.lower()
+        if "payment by phone" not in low and "call" not in low:
+            continue
+        match = pattern.search(chunk.text)
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip(), chunk.source
+    return None
+
+
 @dataclass(frozen=True)
 class _Chunk:
     source: str
@@ -119,6 +178,68 @@ class GCSKnowledgebase:
 
         query_tokens = _tokenize(prompt)
         lowered = prompt.lower()
+
+        # Fast-path deterministic answers for operational questions that
+        # frequently get hallucinated (portal domain, hours, phone payment line).
+        asks_portal = any(
+            k in lowered
+            for k in (
+                "pay online",
+                "payment portal",
+                "portal",
+                "domain",
+                "website",
+                "site",
+            )
+        )
+        asks_hours = any(
+            k in lowered
+            for k in (
+                "hours",
+                "open",
+                "saturday",
+                "weekend",
+            )
+        )
+        asks_phone_payment = any(
+            k in lowered
+            for k in (
+                "pay by phone",
+                "payment by phone",
+                "call to pay",
+                "phone number",
+            )
+        )
+
+        deterministic: list[str] = []
+        sources: set[str] = set()
+        if asks_portal:
+            portal = _extract_payment_portal(snapshot)
+            if portal:
+                value, source = portal
+                deterministic.append(f"Payment portal: {value}")
+                sources.add(source)
+        if asks_hours:
+            hours = _extract_phone_payment_hours(snapshot)
+            if hours:
+                value, source = hours
+                deterministic.append(f"Phone payment hours: {value}")
+                sources.add(source)
+        if asks_phone_payment:
+            phone = _extract_phone_payment_number(snapshot)
+            if phone:
+                value, source = phone
+                deterministic.append(f"Phone payment number: {value}")
+                sources.add(source)
+
+        if deterministic:
+            ordered_sources = ", ".join(sorted(sources))
+            return (
+                "Knowledge base exact matches:\n"
+                + "\n".join(f"- {line}" for line in deterministic)
+                + f"\nSources: {ordered_sources}"
+            )
+
         scored: list[tuple[float, _Chunk]] = []
         for chunk in snapshot.chunks:
             overlap = len(query_tokens & chunk.token_set)

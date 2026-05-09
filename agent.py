@@ -393,7 +393,8 @@ class SalesAgent(Agent):
         """Retrieve policy or process details from the client's GCS knowledge base.
 
         Use this tool whenever the customer asks about company policies, process,
-        fees, timelines, eligibility, documentation, payment terms, or disputes.
+        fees, timelines, eligibility, documentation, payment terms, disputes,
+        payment portal/domain, payment phone number, or business hours.
         """
         if self._knowledgebase is None:
             return (
