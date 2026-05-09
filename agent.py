@@ -21,6 +21,7 @@ from livekit.agents import (
 )
 from livekit.plugins import assemblyai, cartesia, openai, silero
 
+from knowledgebase import GCSKnowledgebase, create_knowledgebase_from_env
 from prompting import build_system_prompt
 
 load_dotenv()
@@ -373,9 +374,58 @@ def _finalize_post_call(
 
 
 class SalesAgent(Agent):
-    def __init__(self, instructions: str, disposition: CallDispositionState) -> None:
+    def __init__(
+        self,
+        instructions: str,
+        disposition: CallDispositionState,
+        knowledgebase: GCSKnowledgebase | None,
+    ) -> None:
         super().__init__(instructions=instructions)
         self._disposition = disposition
+        self._knowledgebase = knowledgebase
+
+    @function_tool
+    async def lookup_knowledgebase(
+        self,
+        context: RunContext,
+        question: str,
+    ) -> str:
+        """Retrieve policy or process details from the client's GCS knowledge base.
+
+        Use this tool whenever the customer asks about company policies, process,
+        fees, timelines, eligibility, documentation, payment terms, disputes,
+        payment portal/domain, payment phone number, or business hours.
+        """
+        if self._knowledgebase is None:
+            return (
+                "Knowledge base is not configured. "
+                "KB_GCS_BUCKET (and optionally KB_GCS_PREFIX / KB_CLIENT_ID) must be set."
+            )
+        return await self._knowledgebase.query(question)
+
+    @function_tool
+    async def answer_operational_question(
+        self,
+        context: RunContext,
+        question: str,
+    ) -> str:
+        """
+        Answer high-risk operational KB questions deterministically.
+
+        Use this for payment portal/domain, payment-by-phone number, and business hours.
+        """
+        if self._knowledgebase is None:
+            return (
+                "I do not have that operational detail available in my current knowledge base. "
+                "I can connect you with a human team member to confirm it."
+            )
+        resolved = await self._knowledgebase.answer_operational_question(question)
+        if resolved:
+            return resolved
+        return (
+            "I do not have that exact operational detail in the knowledge base right now. "
+            "I can connect you with a human team member to confirm it."
+        )
 
     @function_tool
     async def mark_interest_outcome(
@@ -457,7 +507,7 @@ class SalesAgent(Agent):
             self._disposition.notes = clean_note
 
 
-def build_agent() -> tuple[SalesAgent, CallDispositionState]:
+def build_agent() -> tuple[SalesAgent, CallDispositionState, GCSKnowledgebase | None]:
     campaign_type = str(CUSTOMER_PROFILE.get("campaign_type", "pre_approved")).lower()
     script_version = str(CUSTOMER_PROFILE.get("script_version", "A")).upper()
     if campaign_type != "pre_approved":
@@ -470,12 +520,24 @@ def build_agent() -> tuple[SalesAgent, CallDispositionState]:
         script_version=script_version,
         customer_name=CUSTOMER_PROFILE["customer_name"],
     )
+    knowledgebase = create_knowledgebase_from_env()
     disposition = CallDispositionState()
-    return SalesAgent(instructions=prompt, disposition=disposition), disposition
+    return (
+        SalesAgent(
+            instructions=prompt,
+            disposition=disposition,
+            knowledgebase=knowledgebase,
+        ),
+        disposition,
+        knowledgebase,
+    )
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    agent, disposition = build_agent()
+    agent, disposition, knowledgebase = build_agent()
+    if knowledgebase is not None:
+        # Warm cache in parallel so first KB lookup is fast.
+        asyncio.create_task(knowledgebase.warm())
     await ctx.connect()
     call_started_at = datetime.now(tz=timezone.utc)
     transcript: list[TranscriptTurn] = []
